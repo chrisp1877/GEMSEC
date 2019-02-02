@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import GridSearchCV
 
 class AlignmentCalculator:
     p = pd.DataFrame()
@@ -19,8 +20,12 @@ class AlignmentCalculator:
     cluster_keys = []
     tss_df = pd.DataFrame()
     matrices = {}
-    ba_linreg_predictions = pd.DataFrame()
-    ba_linreg_score = 0
+    
+#    Peptide and binder sequence length must be the same
+#    Format of peptides and binders csv:
+#    0  1  2  3  4  5  6  7  8  ...  n (peptide and binder length the same)
+#    A  I  I  D  Y  I  A  Y  M  ...  S
+#    A  I  Y  D  T  M  Q  Y  V  ...  G
     
     def __init__(self, p_path = None, b_path = None):
         self.cluster_keys = ["a", "b", "c", "e", "h", "i", "p", "r"]
@@ -28,7 +33,7 @@ class AlignmentCalculator:
         for key in self.cluster_keys:
             self.matrices[key] = pd.read_csv("./dist_matrices/Euclidean_AA_scaled_cluster_ " + key + ".csv", index_col = 0)
         self.__store_values(p_path, b_path)
-    
+
     def __store_values(self, p_path, b_path):
         if p_path is not None:
             self.p = pd.read_csv(p_path)
@@ -45,6 +50,12 @@ class AlignmentCalculator:
     def set_binders(self, b_path):
         self.__store_values(None, b_path)
         
+#    Format of TSS.csv file must be:
+#               a    b    c    ...  r   
+#    AIIDYIAYM  574  641  662  ...  599
+#    AIYDTMQYV  612  690  742  ...  640
+#    ALATFTVNI  719  782  829  ...  744  
+        
     def import_TSS(self, TSS_path):
         self.tss_df = pd.read_csv(TSS_path)
         self.tss_df.set_index('Unnamed: 0', inplace = True)
@@ -60,14 +71,20 @@ class AlignmentCalculator:
             for i, key in enumerate(self.cluster_keys):
                 total_score = 0
                 for n in range(len(self.binders)):
-                    total_score += sum(self.matrices[key].loc[self.peptides[m][l], \
-                                       self.binders[n][l]] for l in range(self.length) \
+                    total_score += sum(self.matrices[key].loc[self.peptides[m][l],
+                                       self.binders[n][l]] for l in range(self.length)
                                        if self.peptides[m] is not self.binders[n])
                 np_ss[m][i] = total_score
             print(str(m), str(len(self.peptides)))
         similarity_scores = pd.DataFrame(np_ss, index = self.peptides, columns = self.cluster_keys)
         self.tss_df = similarity_scores
         return similarity_scores
+    
+#    Format of binding affinity data must be:
+#    Sequence   Binding Affinity
+#    FLIYFRSPL  -1.04139
+#    RLDPRLAPV  -1.04139
+#    FLMQIAILV  -1.04374
     
     def lin_reg_predict(self, binding_affinity_data_path):
         if self.tss_df.empty:
@@ -78,29 +95,50 @@ class AlignmentCalculator:
         Y = pd.read_csv(binding_affinity_data_path, header = None)
         Y.columns = Y.iloc[0]
         Y = Y.drop(0)
-        Y.set_index('sequence',inplace=True)
+        Y.set_index('Sequence',inplace=True)
         reg = LinearRegression().fit(X, Y)
         prediction = reg.predict(X)
         X['prediction'] = prediction
         data = np.zeros([len(self.peptides), 2])
-        data[:,0] = Y['Binding_affinity']
+        data[:,0] = Y['Binding Affinity']
         data[:,1] = X['prediction']
         score = np.corrcoef(data[:,0], data[:,1])[0, 1]
         predictions = pd.DataFrame(data, index = X.index, columns = ['Binding Affinity', 'Predicted'])
-        self.ba_linreg_predictions = predictions
-        self.ba_linreg_score = score
         return predictions, score
     
-#    def elastic_net_predict(self, binding_affinity_data_path):
-#        if self.tss_df.empty:
-#            self.calculate_TSS()
-#        X = self.tss_df
-#        scaler = MinMaxScaler(feature_range = (-1,1), copy = True)
-#        X = pd.DataFrame(scaler.fit_transform(X, [-1,1]), index = X.index, columns = X.columns)
-#        Y = pd.read_csv(binding_affinity_data_path, header = None)
-#        Y. columns = Y.iloc[0]
-#        Y = Y.drop(0)
-#        Y.set_index('Sequence', inplace = True)
-#        reg = ElasticNet().fit(X, Y)
-#        prediction = reg.predict(X)
-#        X['prediction'] = prediction
+    def elastic_net_predict(self, binding_affinity_data_path):
+        if self.tss_df.empty:
+            self.calculate_TSS()
+        X = self.tss_df
+        scaler = MinMaxScaler(feature_range = (-1,1), copy = True)
+        X = pd.DataFrame(scaler.fit_transform(X, [-1,1]), index = X.index, columns = X.columns)
+        Y = pd.read_csv(binding_affinity_data_path, header = None)
+        Y. columns = Y.iloc[0]
+        Y = Y.drop(0)
+        Y.set_index('Sequence', inplace = True)
+        eNet = ElasticNet(tol=0.1)
+        parametersGrid = {"max_iter": [1, 5, 10],
+                      "alpha": [0.01, 0.1, 1, 10, 100],
+                      "l1_ratio": np.arange(0.0, 1.0, 0.1)}
+        grid = GridSearchCV(eNet, parametersGrid, scoring='r2', cv=10)
+        grid.fit(X, Y)
+        prediction = grid.predict(X)
+        X['prediction'] = prediction
+        data = np.zeros([len(self.peptides), 2])
+        data[:,0] = Y['Binding Affinity']
+        data[:,1] = X['prediction']
+        score = np.corrcoef(data[:,0], data[:,1])[0, 1]
+        predictions = pd.DataFrame(data, index = X.index, columns = ['Binding Affinity', 'Predicted'])
+        return predictions, score
+    
+'''
+To run with already populated TSS matrix:
+
+from AlignmentCalculator import AlignmentCalculator
+
+ac = AlignmentCalculator()
+ac.import_TSS('TSS_scores.csv')
+ac.set_binders('top_binders.csv')
+predicted = ac.lin_reg_predict('largest_mhc0_1.csv')[0]
+score = ac.lin_reg_predict('largest_mhc0_1.csv')[1]
+'''
