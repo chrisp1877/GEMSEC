@@ -13,6 +13,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import GridSearchCV
+from scipy import stats
+import itertools as it
 
 class AlignmentCalculator(object):
     
@@ -34,7 +36,7 @@ class AlignmentCalculator(object):
         if TSS_path is not None: 
             self.import_TSS(TSS_path)
         self.__store_values(p_path, b_path)
-        self.total_scores = self.__create_scores()
+        self.binder_scores = self.get_binder_scores()
 
     #TODO: Special case where Peptide / Binder AA sequences already in single cell
     #Simply storm them as list and then proceed to separate them for computation
@@ -59,22 +61,23 @@ class AlignmentCalculator(object):
                             for n in range(len(list(self.b.index)))]
             self.bin_num = len(self.binders)
         
-    def __create_scores(self):
+    def get_binder_scores(self):
         print("matrix dict setup...")
-        dist = dict.fromkeys(self.cluster_keys, dict.fromkeys(self.AA))
-        for key in dist:
-            for aa in dist[key]:
-                dist[key][aa] = {aa2:self.matrices[key].loc[aa, aa2] for aa2 in self.AA}
+        self.dist = dict.fromkeys(self.cluster_keys, dict.fromkeys(self.AA))
+        for (key, aa) in it.product(self.cluster_keys, self.AA):
+            self.dist[key][aa] = {aa2:self.matrices[key].loc[aa, aa2] for aa2 in self.AA}
         print("Total differences setting up...")
         total_scores = dict.fromkeys(self.cluster_keys, dict.fromkeys(self.AA))
-        for key in self.cluster_keys:
-            for aa in total_scores[key]:
-                total_scores[key][aa] = dict.fromkeys(range(self.length))
-                for l in range(self.length):
-                    total_scores[key][aa][l] = sum(dist[key][aa][self.binders[n][l]]
+        for (key, aa) in it.product(self.cluster_keys, total_scores[key]):
+            total_scores[key][aa] = dict.fromkeys(range(self.length))
+            for l in range(self.length):
+                total_scores[key][aa][l] = sum(self.dist[key][aa][self.binders[n][l]]
                                                for n in range(self.bin_num))
         return total_scores
-                
+    
+    ## TODO Implement Trie to store sequences of known peptide TSS scores for
+    ## faster lookup in TSS vector calculations
+    
     def set_peptides(self, p_path):
         self.__store_values(p_path, None)
     
@@ -92,6 +95,9 @@ class AlignmentCalculator(object):
         if "Unnamed: 0" in list(self.tss_df.columns):
             self.tss_df.set_index('Unnamed: 0', inplace = True)
         self.peptides = list(self.tss_df.index)
+    
+    ## TODO: Rank spearman values still not exactly same as other TSS calculator
+    ## Correlation slightly lower - check algorithm
         
     def calculate_TSS(self):
         if self.p is None or self.b is None:
@@ -100,13 +106,18 @@ class AlignmentCalculator(object):
             raise Exception("Sequence length of peptides and binders must be equal")
         np_ss = np.zeros(shape=(self.pep_num, len(self.cluster_keys)))
         for m in range(self.pep_num):
+            if self.peptides[m] in self.binders:
+                binder_index = self.binders.index(self.peptides[m])
+                for i, key in enumerate(self.cluster_keys):
+                    np_ss[m][i] = -sum(self.matrices[key][self.peptides[m][l]]
+                                  [self.binders[binder_index][l]] 
+                                  for l in range(self.length))
             for i, key in enumerate(self.cluster_keys):
-                np_ss[m][i] = sum(self.total_scores[key][self.peptides[m][l]][l]
+                np_ss[m][i] += sum(self.binder_scores[key][self.peptides[m][l]][l]
                                   for l in range(self.length))
             if m % 500 == 0: print(m / len(self.peptides))
-        similarity_scores = pd.DataFrame(np_ss, index = self.peptides, columns = self.cluster_keys)
-        self.tss_df = similarity_scores
-        return similarity_scores
+        self.tss_df = pd.DataFrame(np_ss, index = self.peptides, columns = self.cluster_keys)
+        return self.tss_df
     
     def random_sample(self, percent_b, percent_p, b = True, p = False):
         if b is True:
@@ -122,15 +133,19 @@ class AlignmentCalculator(object):
         if "Unnamed: 0" in list(X.columns): X = X.set_index("Unnamed: 0")
         scaler = MinMaxScaler(feature_range=(-1,1),copy=True)
         X = pd.DataFrame(scaler.fit_transform(X, [0,1]), index = X.index, columns = X.columns)
-        Y.set_index('AA_seq',inplace=True)
+        Y.set_index('Sequence',inplace=True)
         reg = LinearRegression().fit(X, Y)
         X['Prediction'] = reg.predict(X)
         data = np.zeros([self.pep_num, 2])
-        data[:,0] = Y['Survive3 '].values
+        data[:,0] = Y['Binding Affinity'].values
         data[:,1] = X['Prediction'].values
-        score = np.corrcoef(data[:,0], data[:,1])[0, 1]
+        score_p = np.corrcoef(data[:,0], data[:,1])[0, 1]
+        score_r = stats.spearmanr(data[:,0], data[:,1])[0]
         predictions = pd.DataFrame(data, index = X.index, columns = ['Survive3', 'Predicted'])
-        return predictions, score
+        return predictions, score_p, score_r
+    
+    def elastic_net_predict(self, eluate_data_path):
+        pass
     
 if __name__ == "__main__":
 #     ac = AlignmentCalculator()
@@ -140,9 +155,11 @@ if __name__ == "__main__":
 #     
 #    ex_pep = "../data/set_3_exp/top_peptides_rand_80p.csv"
 #    ex_bin = "../data/set_3_exp/top_binders_rand_100000.csv"
-    ex_pep = 'peptides_full.csv'
-    ex_bin = 'top_binders.csv'
-    bind = pd.read_csv(ex_bin)
-    pep = pd.read_csv(ex_pep)
+    
+    ex_pep = "peptides_full.csv"
+    ex_bin = "top_binders.csv"
     ac = AlignmentCalculator(ex_pep, ex_bin)
     out = ac.calculate_TSS()
+    pred = ac.lin_reg_predict('largest_mhc0_1.csv')[0]
+    score_p = ac.lin_reg_predict('largest_mhc0_1.csv')[1]
+    score_r = ac.lin_reg_predict('largest_mhc0_1.csv')[2]
